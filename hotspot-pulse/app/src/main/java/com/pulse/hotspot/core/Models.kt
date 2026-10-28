@@ -1,9 +1,5 @@
 package com.pulse.hotspot.core
 
-enum class ApState { DISABLED, ENABLING, ENABLED, DISABLING, UNKNOWN;
-    val isOn get() = this == ENABLED || this == ENABLING
-}
-
 /** Internet sources the hotspot could share. */
 data class UpstreamStatus(
     val airplaneMode: Boolean = false,
@@ -20,6 +16,15 @@ data class UpstreamStatus(
     /** At least one of mobile data or Wi-Fi must be available before the hotspot may start. */
     val canShare get() = mobileUsable || wifiConnected
 
+    val sourceLabel: String
+        get() = when {
+            cellularConnected -> "Mobile data"
+            mobileUsable && wifiConnected -> "Mobile data + Wi-Fi"
+            mobileUsable -> "Mobile data"
+            wifiConnected -> "Wi-Fi"
+            else -> "No internet"
+        }
+
     val problem: String?
         get() = when {
             canShare -> null
@@ -31,72 +36,63 @@ data class UpstreamStatus(
         }
 }
 
+/** Thrown when the hotspot is asked to start while neither mobile data nor Wi-Fi is available. */
 class NoUpstreamException(val status: UpstreamStatus) :
     IllegalStateException(status.problem ?: "No internet source")
 
-data class DevicePolicy(
-    val mac: String,
-    val nickname: String = "",
-    val limitBytes: Long = 0,
-    val usedBytes: Long = 0,
-    val downBytes: Long = 0,
-    val upBytes: Long = 0,
-    val manualBlock: Boolean = false,
-    val passExpiresAt: Long = 0,
-    val firstSeen: Long = System.currentTimeMillis(),
-    val lastSeen: Long = System.currentTimeMillis(),
-)
-
-enum class BlockReason(val label: String) { NONE(""), MANUAL("Paused by you"), LIMIT("Data limit reached"), PASS("Time pass expired"), FAIR("Fair share used up") }
-
-data class Client(
-    val mac: String,
-    val ip: String,
-    val iface: String,
-    val name: String,
-    val vendor: String,
-    val policy: DevicePolicy,
-    val effectiveLimit: Long,
-    val blockReason: BlockReason,
-    val speedBps: Long,
-    val online: Boolean,
-) {
-    val blocked get() = blockReason != BlockReason.NONE
-}
-
 data class GuardSettings(
     val sessionCapBytes: Long = 0,
-    val autoOffAtCap: Boolean = true,
-    val fairShare: Boolean = false,
-    val defaultLimitBytes: Long = 0,
-    val forceIpv4Metered: Boolean = true,
-    val batteryGuard: Boolean = false,
+    val warnPercent: Int = 80,
+    val batteryGuard: Boolean = true,
     val batteryThreshold: Int = 20,
-    val idleOff: Boolean = false,
-    val idleMinutes: Int = 10,
+    val onTimeReminder: Boolean = false,
+    val reminderMinutes: Int = 60,
     val backgroundGuard: Boolean = true,
-    val rootEnabled: Boolean = false,
+    val pricePerGb: Double = 0.0,
+    val currency: String = "₹",
     val ssid: String = "",
     val password: String = "",
     val security: String = "WPA",
+    val hiddenNetwork: Boolean = false,
 )
 
 data class SessionStats(
     val startedAt: Long,
     val bytes: Long = 0,
     val speedBps: Long = 0,
-    val peakClients: Int = 0,
-    val lastClientSeenAt: Long = startedAt,
+    val peakSpeedBps: Long = 0,
+    val updatedAt: Long = startedAt,
 ) {
+    val durationSec get() = (updatedAt - startedAt).coerceAtLeast(0) / 1000
+
     /** Seconds until the cap is reached at the current speed, or null when not meaningful. */
     fun secondsToCap(capBytes: Long): Long? {
-        if (capBytes <= 0 || speedBps <= 0) return null
+        if (capBytes <= 0) return null
         val left = capBytes - bytes
         if (left <= 0) return 0
+        if (speedBps <= 0) return null
         return left / speedBps
     }
+
+    fun cost(pricePerGb: Double): Double = if (pricePerGb <= 0) 0.0 else bytes.toDouble() / GB * pricePerGb
 }
 
-data class SessionRecord(val startedAt: Long, val endedAt: Long, val bytes: Long, val peakClients: Int)
+data class SessionRecord(val startedAt: Long, val endedAt: Long, val bytes: Long)
 
 data class BatteryInfo(val percent: Int = 100, val charging: Boolean = false)
+
+/** Converts interface byte counters into bytes that actually crossed the shared upstream. */
+object TrafficMath {
+    data class Sample(val mobile: Long, val total: Long)
+
+    fun upstreamDelta(prev: Sample, now: Sample, cellular: Boolean): Long {
+        val dMobile = (now.mobile - prev.mobile).coerceAtLeast(0)
+        val dTotal = (now.total - prev.total).coerceAtLeast(0)
+        // Shared Wi-Fi traffic is counted on both the client and the hotspot interface.
+        return if (cellular) dMobile else ((dTotal - dMobile).coerceAtLeast(0) / 2)
+    }
+
+    /** Exponential moving average for a smooth speed readout. */
+    fun smooth(previous: Long, instant: Long, alpha: Double = 0.35): Long =
+        if (previous <= 0) instant else (alpha * instant + (1 - alpha) * previous).toLong()
+}
